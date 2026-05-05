@@ -1,12 +1,13 @@
 # AGENTS.md
 
 ## Project
-FUSE3 userspace driver to mount CP/M Plus (CP/M 3) 8-bit disk images, named `plus3dos`.
+FUSE3 userspace driver to mount 8-bit disk images, named `plus3dos`.
 
 ## Build
 - `make` / `make all`: Build `build/plus3fuse` (requires `libfuse3-dev` system package)
 - `make clean`: Remove `build/` artifacts
-- `make test`: Placeholder for testing with CP/M disk images in `tests/`
+- `make test`: Placeholder for testing with disk images in `tests/`
+- `images should be mounted locally in ./mnt`
 
 ## Structure
 - `src/main.c`: FUSE entry point, callback wiring
@@ -17,5 +18,4 @@ FUSE3 userspace driver to mount CP/M Plus (CP/M 3) 8-bit disk images, named `plu
 
 ## Conventions
 - Standard GCC only, no non-standard dependencies beyond `libfuse3`
-- CP/M 3 structures match [CP/M Plus spec](https://www.seasip.info/Cpm/3plus.html)
 - FUSE callbacks delegate to `plus3dos_*` functions

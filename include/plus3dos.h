@@ -19,14 +19,26 @@
 #define CPM_MAX_EXTENTS 32
 #define CPM_FILENAME_LEN 12
 
+#define IDEDOS_SIGNATURE "PLUSIDEDOS"
+#define IDEDOS_HEADER_SIZE 512
+#define IDEDOS_PARTITION_NAME_LEN 16
+#define IDEDOS_PARTITION_INFO_LEN 32
+#define IDEDOS_NUM_PARTITIONS 8
+#define IDEDOS_PARTITION_TYPE_P3DOS 3
+
+#define PLUS3DOS_HEADER_MAGIC "PLUS3DOS\x1A"
+#define PLUS3DOS_HEADER_SIZE 128
+
 typedef struct {
-	uint8_t name[8];
-	uint8_t ext[3];
-	uint8_t extent;
-	uint8_t record_count;
-	uint8_t alloc_blocks[16];
-	uint8_t reserved[5];
-} __attribute__((packed)) cpm_dirent;
+	uint8_t status;           // Byte 0: status (0xE5=deleted, 0x00=unused, <16=valid)
+	uint8_t name[8];          // Bytes 1-8: filename (bit 7 cleared)
+	uint8_t ext[3];           // Bytes 9-11: extension (bit 7 cleared)
+	uint8_t extent_low;       // Byte 12: extent number (bits 0-4)
+	uint8_t bcount;           // Byte 13: bytes in last record
+	uint8_t extent_high;      // Byte 14: extent number (bits 5-10)
+	uint8_t rcount;           // Byte 15: record count for this extent
+	uint8_t al[16];           // Bytes 16-31: block numbers (1 byte each in simple mode)
+} __attribute__((packed)) plus3dos_dirent;
 
 typedef struct {
 	uint8_t alloc_blocks[16];
@@ -39,7 +51,21 @@ typedef struct {
 	cpm_extent_info extents[CPM_MAX_EXTENTS];
 	uint8_t num_extents;
 	int valid;
+	int has_header;           // 1 if file has +3DOS header
+	uint32_t header_file_size; // File size from +3DOS header
 } cpm_file_info;
+
+typedef struct {
+	uint8_t name[IDEDOS_PARTITION_NAME_LEN];
+	uint8_t sysinfo[IDEDOS_PARTITION_INFO_LEN];
+	uint8_t info[IDEDOS_PARTITION_INFO_LEN];
+} __attribute__((packed)) idedos_partition_t;
+
+typedef struct {
+	uint32_t start_sector;
+	uint32_t total_sectors;
+	uint8_t xdpb[28];
+} idedos_partition_info_t;
 
 typedef struct {
 	int fd;
@@ -51,11 +77,18 @@ typedef struct {
 	uint32_t off;
 	uint32_t drm;
 	uint32_t spt;
+	uint8_t bsh;              // Block shift (from XDPB byte 2)
+	uint32_t block_size;      // 128 << BSH
 	uint8_t *alloc_map;
 	uint32_t alloc_map_size;
 	cpm_file_info *files;
 	uint32_t num_files;
 	uint32_t files_capacity;
+	uint32_t partition_start;
+	uint32_t partition_size;
+	int is_idedos;
+	uint8_t drive_heads;
+	uint8_t drive_spt;
 } plus3dos_ctx;
 
 plus3dos_ctx *plus3dos_init(const char *image_path);
