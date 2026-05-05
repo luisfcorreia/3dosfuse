@@ -1,3 +1,4 @@
 build/
 *.o
 plus3fuse
+test.img
