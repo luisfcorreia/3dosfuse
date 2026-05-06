@@ -15,80 +15,72 @@
 #endif
 
 static int read_block(plus3dos_ctx *ctx, uint32_t block_num, uint8_t *buf) {
-	// Calculate disk offset: partition start (in sectors) * sector_size + block_num * block_size
 	off_t disk_offset = (off_t)ctx->partition_start * ctx->sector_size + (off_t)block_num * ctx->block_size;
-	// Interleaved image format: file offset = disk offset * 2
-	off_t file_offset = disk_offset * 2;
-	size_t read_size = ctx->block_size * 2;
-	
-	uint8_t *temp = malloc(read_size);
-	if (!temp) return -1;
-	
+	off_t file_offset = disk_offset;
+	size_t read_size = ctx->block_size;
+
+	DBG("read_block: block_num=%u, disk_offset=%jd, file_offset=%jd, read_size=%zu",
+		block_num, (intmax_t)disk_offset, (intmax_t)file_offset, read_size);
+
 	if (lseek(ctx->fd, file_offset, SEEK_SET) < 0) {
-		free(temp);
 		return -1;
 	}
-	if (read(ctx->fd, temp, read_size) != (ssize_t)read_size) {
-		free(temp);
+	if (read(ctx->fd, buf, read_size) != (ssize_t)read_size) {
 		return -1;
 	}
-	
-	for (uint32_t i = 0; i < ctx->block_size; i++) {
-		buf[i] = temp[i * 2];
-	}
-	
-	free(temp);
+
 	return 0;
 }
 
-static int parse_idedos_header(plus3dos_ctx *ctx) {
-	// IDEDOS partition table starts at disk offset 0
-	// Each entry is 64 bytes, stored interleaved (1 data byte + 1 padding)
-	// File offset = disk_offset * 2
+static void build_filename(const plus3dos_dirent *ent, char *name) {
+	int i, pos = 0;
+	for (i = 0; i < 8; i++) {
+		uint8_t c = ent->name[i] & 0x7F;
+		if (c == ' ' || c == 0) break;
+		name[pos++] = c;
+	}
+	if (pos == 0) { name[0] = '\0'; return; }
+	name[pos++] = '.';
+	for (i = 0; i < 3; i++) {
+		uint8_t c = ent->ext[i] & 0x7F;
+		if (c == ' ' || c == 0) break;
+		name[pos++] = c;
+	}
+	if (name[pos-1] == '.') pos--;
+	name[pos] = '\0';
+}
 
-	// Read first entry (System Partition)
-	uint8_t raw_entry0[128];  // 64 bytes * 2 for interleaving
+static int is_valid_dirent(const plus3dos_dirent *ent) {
+	if (ent->status == 0xE5 || ent->status == 0x00) return 0;
+	return 1;
+}
+
+static int parse_idedos_header(plus3dos_ctx *ctx) {
+	uint8_t entry0[64];
 
 	if (lseek(ctx->fd, 0, SEEK_SET) < 0) return -1;
-	if (read(ctx->fd, raw_entry0, 128) != 128) return -1;
+	if (read(ctx->fd, entry0, 64) != 64) return -1;
 
-	uint8_t entry0[64];
-	for (int j = 0; j < 64; j++) entry0[j] = raw_entry0[j * 2];
-
-	// Check for IDEDOS signature in first entry's name field
 	if (memcmp(entry0, IDEDOS_SIGNATURE, 10) != 0) {
-		DBG("Not an IDEDOS image (no signature in first entry)");
+		DBG("Not an IDEDOS image");
 		return -1;
 	}
 
-	DBG("Found IDEDOS image");
-
-	// First pass: Read System Partition (entry 0) to get drive geometry
-	// Geometry is at bytes 32-39 of entry (entry[32]-entry[39])
-	// entry[34] = number of heads (NH)
-	// entry[35] = sectors per track (ST)
 	ctx->drive_heads = entry0[34];
 	ctx->drive_spt = entry0[35];
-	DBG("System Partition: heads=%u, sectors_per_track=%u", ctx->drive_heads, ctx->drive_spt);
+	DBG("System Partition: heads=%u, spt=%u", ctx->drive_heads, ctx->drive_spt);
 
 	if (ctx->drive_heads == 0 || ctx->drive_spt == 0) {
-		DBG("Invalid drive geometry, using defaults (16 heads, 63 spt)");
 		if (ctx->drive_heads == 0) ctx->drive_heads = 16;
 		if (ctx->drive_spt == 0) ctx->drive_spt = 63;
 	}
 
-	// Second pass: Find +3DOS partition (type 0x03)
-	// Entry 0 is System Partition, start from entry 1
 	for (int i = 1; i < IDEDOS_NUM_PARTITIONS; i++) {
-		uint8_t raw_entry[128];
-		// File offset = disk_offset * 2 = (i * 64) * 2 = i * 128
-		off_t entry_offset = (i * 64) * 2;
+		uint8_t entry[64];
+		off_t entry_offset = i * 64;
 
 		if (lseek(ctx->fd, entry_offset, SEEK_SET) < 0) break;
-		if (read(ctx->fd, raw_entry, 128) != 128) break;
-
-		uint8_t entry[64];
-		for (int j = 0; j < 64; j++) entry[j] = raw_entry[j * 2];
+		if (read(ctx->fd, entry, 64) != 64) break;
 
 		uint8_t *name = entry;
 		uint8_t *sysinfo = entry + 16;
@@ -98,75 +90,56 @@ static int parse_idedos_header(plus3dos_ctx *ctx) {
 		uint8_t part_type = sysinfo[0];
 		DBG("Partition %d: name=%.16s, type=0x%02X", i, name, part_type);
 
-		// Only process +3DOS partitions (type 0x03)
 		if (part_type != 0x03) continue;
 
-		// Parse CHS start using drive geometry
 		uint16_t cyl = sysinfo[1] | (sysinfo[2] << 8);
 		uint8_t head = sysinfo[3];
-		// LBA = (cylinder * heads_per_cylinder + head) * sectors_per_track
 		uint32_t start_sector = (uint32_t)(cyl * ctx->drive_heads + head) * ctx->drive_spt;
 
 		DBG("  CHS: cyl=%u, head=%u -> LBA=%u", cyl, head, start_sector);
 
-		// Read XDPB from bytes 32-59 of partition entry (28 bytes of eXDPB)
 		uint8_t *xdpb = entry + 32;
 
-		// Parse key XDPB fields (little-endian, from +3e spec)
-		uint16_t drm = xdpb[7] | (xdpb[8] << 8);
-		uint16_t off = xdpb[13] | (xdpb[14] << 8);
-		uint8_t spt = xdpb[19];
-		uint16_t sector_size = xdpb[21] | (xdpb[22] << 8);
-		uint8_t first_sector = xdpb[20];
+		DBG("  Raw XDPB: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+			xdpb[0], xdpb[1], xdpb[2], xdpb[3], xdpb[4], xdpb[5], xdpb[6], xdpb[7],
+			xdpb[8], xdpb[9], xdpb[10], xdpb[11], xdpb[12], xdpb[13], xdpb[14], xdpb[15],
+			xdpb[16], xdpb[17], xdpb[18], xdpb[19], xdpb[20], xdpb[21], xdpb[22], xdpb[23],
+			xdpb[24], xdpb[25], xdpb[26], xdpb[27]);
 
-		DBG("  XDPB: DRM=%u, OFF=%u, SPT=%u, sector_size=%u, first_sector=%u",
-			drm, off, spt, sector_size, first_sector);
+		// +3DOS XDPB layout (from Sinclair Wiki):
+		// bytes 0-1: SPT (records per track, 16-bit LE)
+		// byte 2: BSH (log2(block size / 128))
+		// byte 3: BLM (block size / 128 - 1)
+		// byte 4: EXM (extent mask)
+		// bytes 5-6: DSM (last block number, 16-bit LE)
+		// bytes 7-8: DRM (last directory entry number, 16-bit LE)
+		// bytes 9-10: AL0/AL1 (directory bit map)
+		// bytes 11-12: CKS (checksum size, 16-bit LE)
+		// bytes 13-14: OFF (reserved tracks/blocks, 16-bit LE)
+		// byte 15: PSH (log2(sector size / 128))
+		// byte 16: PHM (sector size / 128 - 1)
+		// bytes 21-22: Sector size (16-bit LE)
+		uint8_t bsh = xdpb[2];
+		uint32_t block_size = 128U << bsh;
 
-		if (spt == 0 || sector_size == 0) {
-			DBG("  Invalid XDPB, skipping");
-			continue;
-		}
+		uint16_t drm = xdpb[7] | (xdpb[8] << 8);     // DRM at 7-8 (last dir entry num = 511)
+		uint16_t off = xdpb[13] | (xdpb[14] << 8);    // OFF at 13-14 (reserved blocks before dir)
+		uint16_t spt = xdpb[0] | (xdpb[1] << 8);     // SPT at 0-1
+		// IDE disks use 512-byte sectors; PSH in XDPB is for floppy
+		uint16_t sector_size = 512;  // Standard IDE sector size
 
-		// Set context for read_sector() to work during validation
+		DBG("  XDPB: BSH=%u (block_size=%u), DRM=%u, OFF=%u, SPT=%u, sector_size=%u",
+			bsh, block_size, drm, off, spt, sector_size);
+
 		ctx->is_idedos = 1;
 		ctx->partition_start = start_sector;
 		ctx->sector_size = sector_size;
-		ctx->sectors_per_track = spt;
-		ctx->first_sector = first_sector;
-
-		// Test if directory has any entries
-		uint8_t test_sector[512];
-		uint32_t dir_track = off;
-		uint8_t dir_sector = first_sector;
-
-		int dir_valid = 0;
-		if (read_sector(ctx, dir_track, dir_sector, test_sector) == 0) {
-			DBG("  Read dir sector, first 16 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-				test_sector[0], test_sector[1], test_sector[2], test_sector[3],
-				test_sector[4], test_sector[5], test_sector[6], test_sector[7],
-				test_sector[8], test_sector[9], test_sector[10], test_sector[11],
-				test_sector[12], test_sector[13], test_sector[14], test_sector[15]);
-
-			if (test_sector[0] != 0x00 && test_sector[0] != 0xE5) {
-				dir_valid = 1;
-			}
-		}
-
-		if (!dir_valid) {
-			// Reset context since we're skipping this partition
-			ctx->is_idedos = 0;
-			ctx->partition_start = 0;
-			DBG("  Partition '%s' has empty directory, skipping", name);
-			continue;
-		}
-
-		// Keep the context values set above
-		ctx->tracks = 0;
+		ctx->block_size = block_size;
 		ctx->spt = spt;
 		ctx->off = off;
 		ctx->drm = drm;
 
-		DBG("  Using partition '%s'", name);
+		DBG("  Using Partition '%s' (type=0x%02X)", name, part_type);
 		return 0;
 	}
 
@@ -174,73 +147,55 @@ static int parse_idedos_header(plus3dos_ctx *ctx) {
 	return -1;
 }
 
-static void build_filename(const cpm_dirent *ent, char *name) {
-	int i, pos = 0;
-	for (i = 0; i < 8; i++) {
-		if (ent->name[i] == ' ' || ent->name[i] == 0) break;
-		name[pos++] = ent->name[i];
-	}
-	if (ent->ext[0] != ' ' && ent->ext[0] != 0) {
-		name[pos++] = '.';
-		for (i = 0; i < 3; i++) {
-			if (ent->ext[i] == ' ' || ent->ext[i] == 0) break;
-			name[pos++] = ent->ext[i];
-		}
-	}
-	name[pos] = '\0';
-}
-
-static int is_valid_dirent(const cpm_dirent *ent) {
-	if (ent->name[0] == 0xE5) return 0;
-	if (ent->name[0] == 0x00) return 0;
-	return 1;
-}
-
 static int load_directory(plus3dos_ctx *ctx) {
-	uint8_t sector_buf[512];
-	uint32_t sector_size = ctx->sector_size;
-	uint32_t dir_start_track = ctx->off;
-	uint32_t dir_entries = ctx->drm + 1;
-	uint32_t dir_sectors = ((dir_entries * CPM_DIR_ENTRY_SIZE) + sector_size - 1) / sector_size;
+	uint32_t dir_start_block = ctx->off;
+	uint32_t dir_blocks = ((ctx->drm + 1) * CPM_DIR_ENTRY_SIZE + ctx->block_size - 1) / ctx->block_size;
 
-	ctx->files_capacity = dir_entries;
-	ctx->files = calloc(dir_entries, sizeof(cpm_file_info));
+	DBG("load_directory: start_block=%u, dir_blocks=%u, block_size=%u, drm=%u",
+		dir_start_block, dir_blocks, ctx->block_size, ctx->drm);
+	DBG("  partition_start=%u, sector_size=%u", ctx->partition_start, ctx->sector_size);
+
+	ctx->files_capacity = ctx->drm + 1;
+	ctx->files = calloc(ctx->files_capacity, sizeof(cpm_file_info));
 	if (!ctx->files) return -ENOMEM;
 
 	ctx->num_files = 0;
 
-	for (uint32_t sec = 0; sec < dir_sectors; sec++) {
-		uint32_t track = dir_start_track + (sec / ctx->sectors_per_track);
-		uint8_t sector = ctx->first_sector + (sec % ctx->sectors_per_track);
-
-		if (read_sector(ctx, track, sector, sector_buf) < 0) {
-			DBG("Failed to read directory sector %u/%u", track, sector);
+	for (uint32_t blk = 0; blk < dir_blocks; blk++) {
+		uint8_t block_buf[8192];
+		if (read_block(ctx, dir_start_block + blk, block_buf) < 0) {
+			DBG("Failed to read directory block %u", dir_start_block + blk);
 			break;
 		}
 
-		DBG("Read dir sector, first 16 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-			sector_buf[0], sector_buf[1], sector_buf[2], sector_buf[3], sector_buf[4], sector_buf[5], sector_buf[6], sector_buf[7],
-			sector_buf[8], sector_buf[9], sector_buf[10], sector_buf[11], sector_buf[12], sector_buf[13], sector_buf[14], sector_buf[15]);
+		DBG("  Read dir block %u (block %u), first 32 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+			blk, dir_start_block + blk,
+			block_buf[0], block_buf[1], block_buf[2], block_buf[3],
+			block_buf[4], block_buf[5], block_buf[6], block_buf[7],
+			block_buf[8], block_buf[9], block_buf[10], block_buf[11],
+			block_buf[12], block_buf[13], block_buf[14], block_buf[15]);
 
-		int entries_per_sector = sector_size / CPM_DIR_ENTRY_SIZE;
-		for (int j = 0; j < entries_per_sector && (sec * entries_per_sector + j) < dir_entries; j++) {
-			cpm_dirent *ent = (cpm_dirent *)(sector_buf + j * CPM_DIR_ENTRY_SIZE);
+		int entries_per_block = ctx->block_size / CPM_DIR_ENTRY_SIZE;
+		for (int j = 0; j < entries_per_block && (blk * entries_per_block + j) <= ctx->drm; j++) {
+			plus3dos_dirent *ent = (plus3dos_dirent *)(block_buf + j * CPM_DIR_ENTRY_SIZE);
 
 			if (!is_valid_dirent(ent)) continue;
 
 			char name[CPM_FILENAME_LEN + 1];
 			build_filename(ent, name);
 
+			if (name[0] == '\0') continue;
+
+			uint8_t extent = ent->extent_low & 0x1F;
+
 			int found = 0;
 			for (uint32_t k = 0; k < ctx->num_files; k++) {
 				if (strcmp((char *)ctx->files[k].name, name) == 0) {
 					found = 1;
-					uint8_t ext = ent->extent & 0x1F;
-					if (ext < CPM_MAX_EXTENTS) {
-						memcpy(ctx->files[k].extents[ext].alloc_blocks, ent->alloc_blocks, 16);
-						ctx->files[k].extents[ext].record_count = ent->record_count;
-						if (ext >= ctx->files[k].num_extents) ctx->files[k].num_extents = ext + 1;
-						ctx->files[k].size += ent->record_count * 128;
+					if (extent < CPM_MAX_EXTENTS) {
+						memcpy(ctx->files[k].extents[extent].alloc_blocks, ent->al, 16);
+						ctx->files[k].extents[extent].record_count = ent->rcount;
+						if (extent >= ctx->files[k].num_extents) ctx->files[k].num_extents = extent + 1;
 					}
 					break;
 				}
@@ -252,19 +207,48 @@ static int load_directory(plus3dos_ctx *ctx) {
 				snprintf((char *)fi->name, CPM_FILENAME_LEN + 1, "%s", name);
 				fi->valid = 1;
 
-				uint8_t ext = ent->extent & 0x1F;
-				if (ext < CPM_MAX_EXTENTS) {
-					memcpy(fi->extents[ext].alloc_blocks, ent->alloc_blocks, 16);
-					fi->extents[ext].record_count = ent->record_count;
-					fi->num_extents = ext + 1;
+				if (extent < CPM_MAX_EXTENTS) {
+					memcpy(fi->extents[extent].alloc_blocks, ent->al, 16);
+					fi->extents[extent].record_count = ent->rcount;
+					fi->num_extents = extent + 1;
 				}
-				fi->size = ent->record_count * 128;
 				ctx->num_files++;
-}
+			}
+		}
 	}
 
-	return 0;
-}
+	// Check for +3DOS headers and calculate file sizes
+	for (uint32_t i = 0; i < ctx->num_files; i++) {
+		cpm_file_info *fi = &ctx->files[i];
+		uint32_t total_size = 0;
+
+		for (uint32_t ext = 0; ext < fi->num_extents && ext < CPM_MAX_EXTENTS; ext++) {
+			cpm_extent_info *ei = &fi->extents[ext];
+			for (int b = 0; b < 16; b++) {
+				if (ei->alloc_blocks[b] != 0) {
+					total_size += ctx->block_size;
+				}
+			}
+		}
+
+		fi->size = total_size;
+
+		// Check first block for +3DOS header
+		if (fi->num_extents > 0 && fi->extents[0].alloc_blocks[0] != 0) {
+			uint8_t first_block[8192];
+			uint32_t block_num = fi->extents[0].alloc_blocks[0];
+			if (read_block(ctx, block_num, first_block) == 0) {
+				if (memcmp(first_block, PLUS3DOS_HEADER_MAGIC, 9) == 0) {
+					fi->has_header = 1;
+					fi->header_file_size = first_block[9] | (first_block[10] << 8);
+					fi->size = fi->header_file_size;
+					DBG("File '%s' has +3DOS header, size=%u", fi->name, fi->header_file_size);
+				}
+			}
+		}
+
+		DBG("File: '%s', size=%u, extents=%u", fi->name, fi->size, fi->num_extents);
+	}
 
 	return 0;
 }
@@ -279,7 +263,6 @@ plus3dos_ctx *plus3dos_init(const char *image_path) {
 		return NULL;
 	}
 
-	// Parse IDEDOS header - fail if not IDEDOS
 	if (parse_idedos_header(ctx) != 0) {
 		DBG("Failed to parse IDEDOS image");
 		close(ctx->fd);
@@ -287,20 +270,7 @@ plus3dos_ctx *plus3dos_init(const char *image_path) {
 		return NULL;
 	}
 
-	DBG("Using IDEDOS partition, start=%u", ctx->partition_start);
-
-// Validate spt before use to avoid division by zero
-	if (ctx->spt == 0) {
-		DBG("WARNING: spt is 0, setting to 1 to avoid division by zero");
-		ctx->spt = 1;
-	}
-
-	if (ctx->drm == 0) {
-		DBG("WARNING: drm is 0, setting to 32");
-		ctx->drm = 32;
-	}
-
-	DBG("Loading directory: off=%u, drm=%u", ctx->off, ctx->drm);
+	DBG("Using IDEDOS partition, start=%u, block_size=%u", ctx->partition_start, ctx->block_size);
 
 	if (load_directory(ctx) < 0) {
 		plus3dos_destroy(ctx);
@@ -387,40 +357,50 @@ int plus3dos_read(const char *path, char *buf, size_t size, off_t offset, struct
 			if (offset >= (off_t)fi_info->size) return 0;
 			if (offset + size > fi_info->size) size = fi_info->size - offset;
 
-			uint32_t record_offset = offset / 128;
 			uint32_t bytes_read = 0;
+			uint32_t data_offset = offset;
+
+			// If file has +3DOS header, skip it in the first block
+			if (fi_info->has_header) {
+				// Header is 128 bytes at start of first block
+				// Data starts after header
+				data_offset += PLUS3DOS_HEADER_SIZE;
+			}
 
 			while (bytes_read < size) {
-				uint32_t rec = record_offset + (bytes_read / 128);
-				uint32_t rec_offset = bytes_read % 128;
-				uint32_t rec_bytes = 128 - rec_offset;
-				if (rec_bytes > size - bytes_read) rec_bytes = size - bytes_read;
+				uint32_t block_offset = data_offset / ctx->block_size;
+				uint32_t offset_in_block = data_offset % ctx->block_size;
+				uint32_t to_read = ctx->block_size - offset_in_block;
+				if (to_read > size - bytes_read) to_read = size - bytes_read;
 
-				uint32_t extent = rec / 128;
-				uint32_t rec_in_extent = rec % 128;
+				// Find which block number corresponds to block_offset
+				uint32_t block_num = 0;
+				uint32_t found = 0;
+				uint32_t cum_blocks = 0;
 
-				if (extent >= CPM_MAX_EXTENTS || rec_in_extent >= 128) break;
+				for (uint32_t ext = 0; ext < fi_info->num_extents && ext < CPM_MAX_EXTENTS; ext++) {
+					cpm_extent_info *ei = &fi_info->extents[ext];
+					for (int b = 0; b < 16; b++) {
+						if (ei->alloc_blocks[b] != 0) {
+							if (cum_blocks == block_offset) {
+								block_num = ei->alloc_blocks[b];
+								found = 1;
+								break;
+							}
+							cum_blocks++;
+						}
+					}
+					if (found) break;
+				}
 
-				cpm_extent_info *ext_info = &fi_info->extents[extent];
-				if (ext_info->record_count == 0) break;
+				if (!found) break;
 
-				uint8_t alloc_idx = rec_in_extent / 8;
-				uint8_t block_num = (alloc_idx < 16) ? ext_info->alloc_blocks[alloc_idx] : 0;
+				uint8_t block_data[8192];
+				if (read_block(ctx, block_num, block_data) < 0) break;
 
-				if (block_num == 0) break;
-
-				uint32_t block_size = 1024;
-				uint32_t sector_in_block = rec_in_extent % 8;
-				uint32_t data_start_sector = (uint32_t)block_num * (block_size / ctx->sector_size) + sector_in_block;
-
-				uint32_t track = data_start_sector / ctx->sectors_per_track;
-				uint8_t sector = ctx->first_sector + (data_start_sector % ctx->sectors_per_track);
-
-				uint8_t record_buf[128];
-				if (read_sector(ctx, track, sector, record_buf) < 0) break;
-
-				memcpy(buf + bytes_read, record_buf + rec_offset, rec_bytes);
-				bytes_read += rec_bytes;
+				memcpy(buf + bytes_read, block_data + offset_in_block, to_read);
+				bytes_read += to_read;
+				data_offset += to_read;
 			}
 
 			return bytes_read;
