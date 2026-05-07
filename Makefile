@@ -19,7 +19,7 @@ build:
 clean:
 	rm -rf build
 
-test: build/$(TARGET)
-	@echo "Test requires a CP/M disk image. Place in tests/ and run: ./build/plus3fuse tests/image.img /mnt/cpm"
+#test: build/$(TARGET)
+#	@echo "Test requires a CP/M disk image. Place in tests/ and run: ./build/plus3fuse tests/image.img /mnt/cpm"
 
 .PHONY: all clean test
